@@ -10,6 +10,7 @@ already seen in seen.db, so you only ever get told about new stuff.
 
 import os
 import re
+import sys
 import json
 import time
 import html
@@ -22,6 +23,10 @@ import requests
 from bs4 import BeautifulSoup
 
 import trip
+
+# Without this, print() output is buffered and GitHub shows a blank log until
+# the job ends. Line buffering makes the run watchable in real time.
+sys.stdout.reconfigure(line_buffering=True)
 
 # ----------------------------------------------------------------------
 # CONFIG - edit this bit
@@ -78,27 +83,41 @@ ALWAYS_NOTIFY_SCORE = 5    # a 5/5 gets through even if it's above median
 # it just lands silently. Local hours, 24h.
 QUIET_FROM, QUIET_TO = 23, 8
 
+# Hard stop. The schedule fires every 10 minutes; a run that takes longer than
+# this gets cut off mid-sweep and picks up where it left off next time, since
+# everything already seen is recorded as it goes.
+MAX_RUNTIME_MIN = 8
+
+# Silence is ambiguous: it could mean "no good wheels" or "broken three weeks
+# ago". If nothing has been sent in this long, send a short status note.
+HEARTBEAT_HOURS = 24
+
 # Search pages to poll. Add or remove freely.
 # Bolha search URL format: https://www.bolha.com/?ctl=search_ads&keywords=XXX
+# Two kinds of source. Categories are stable and worth sweeping every time;
+# search URLs move around (the old ?ctl=search_ads format silently stopped
+# working and served a generic page instead). Categories first for that reason.
+# Categories first - they are stable, and bolha has one called literally
+# "Volani in pedala". Searches second, because the URL format moves around:
+# the old ?ctl=search_ads silently stopped searching and served a generic page.
 SEARCHES = [
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=volan+pedala"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=sim+racing"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=logitech+g29"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=logitech+g27"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=thrustmaster"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=fanatec"),
-    ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=igralni+volan"),
-    # salomon.si is deliberately absent: its robots.txt disallows automated
-    # access, so the polite move is to check that one by hand. Their site has
-    # its own search you can bookmark.
-    # Croatia. Same company as Bolha, same page template. With the cap at
-    # 150 km the whole Zagreb area is in range, which is where the actual
-    # sim racing market is. Croatian hits get toll money added on top.
-    ("njuskalo", "https://www.njuskalo.hr/?ctl=search_ads&keywords=volan+pedale"),
-    ("njuskalo", "https://www.njuskalo.hr/?ctl=search_ads&keywords=sim+racing"),
-    ("njuskalo", "https://www.njuskalo.hr/?ctl=search_ads&keywords=logitech+g29"),
-    ("njuskalo", "https://www.njuskalo.hr/?ctl=search_ads&keywords=thrustmaster"),
-    ("njuskalo", "https://www.njuskalo.hr/?ctl=search_ads&keywords=fanatec"),
+    # --- the bullseye
+    ("bolha", "https://www.bolha.com/volani-in-pedala-pc"),
+    ("njuskalo", "https://www.njuskalo.hr/gaming-oprema"),
+
+    # --- neighbouring categories, for sellers who filed it wrong
+    ("bolha", "https://www.bolha.com/gamepad-i-pc"),
+    ("bolha", "https://www.bolha.com/pc-dodatki"),
+    ("bolha", "https://www.bolha.com/ostale-konzole"),
+    ("njuskalo", "https://www.njuskalo.hr/pc-igre"),
+    ("njuskalo", "https://www.njuskalo.hr/igrace-konzole"),
+    ("njuskalo", "https://www.njuskalo.hr/informatika-sve-ostalo"),
+
+    # --- searches, to catch anything filed somewhere unexpected entirely
+    ("bolha", "https://www.bolha.com/search/?keywords=volan+pedala"),
+    ("bolha", "https://www.bolha.com/search/?keywords=igralni+volan"),
+    ("bolha", "https://www.bolha.com/search/?keywords=fanatec"),
+    ("njuskalo", "https://www.njuskalo.hr/search/?keywords=volan+pedale"),
 ]
 
 # Secrets come from environment variables. Never hardcode them here.
@@ -356,7 +375,7 @@ BAD_CATEGORY = re.compile(
     r"/(elektricna-kolesa|zlozljiva-kolesa|gorska-kolesa|cestna-kolesa|kolesa|"
     r"bicikli|motorna-kolesa|mopedi|skuterji|avtomobili|osebni-avtomobili|"
     r"tovorna-vozila|prikolice|plovila|coln|nepremicnine|stanovanja|hise|"
-    r"obutev|oblacila|pohistvo|otroska|igrace|vrt|kmetijstvo|zivali|"
+    r"obutev|oblacila|pohistvo|vrt|kmetijstvo|zivali|"
     r"gospodinjski|kozmetika|knjige|glasbila|nakit|ure)/", re.I)
 
 # A sim rig has a wheel. Pedals alone match bicycles, sewing machines and
@@ -621,8 +640,8 @@ def judge_anthropic(listing, detail_text):
 
 def post_with_retry(url, **kw):
     """Free API tiers rate-limit hard. Honour Retry-After, back off, try again."""
-    delay = 4
-    for attempt in range(4):
+    delay = 3
+    for attempt in range(2):
         r = requests.post(url, **kw)
         if r.status_code != 429:
             r.raise_for_status()
@@ -800,6 +819,7 @@ def notify(listing, verdict, med, n_samples, ride):
     hour = time.localtime().tm_hour
     quiet = hour >= QUIET_FROM or hour < QUIET_TO
     push(text, title=subject, url=listing["url"], quiet=quiet)
+    note_push(con_global)
 
     print(f"  NOTIFIED: {listing['title'][:50]} | {price} | {market}")
 
@@ -863,24 +883,68 @@ def push(text, title=None, url=None, quiet=False):
 def alert_plain(text):
     """Out-of-band message for 'your scraper is broken' type news."""
     push(text, title="simwatch")
+    note_push(con_global)
+
+
+def note_push(con):
+    if con:
+        con.execute("INSERT OR REPLACE INTO health VALUES ('last_push', ?)",
+                    (str(int(time.time())),))
+        con.commit()
+
+
+def hours_since_last_push(con):
+    row = con.execute("SELECT v FROM health WHERE k='last_push'").fetchone()
+    if not row:
+        return None
+    return (time.time() - int(row[0])) / 3600
+
+
+def median_summary(con):
+    """One line per tier: how many prices known and what the middle one is."""
+    bits = []
+    for tier in ("entry", "mid", "high", "unknown"):
+        med, n = median_price(con, tier)
+        if n:
+            bits.append(f"{tier}: {n} seen"
+                        + (f", median {med:.0f} EUR" if med else ", no median yet"))
+    return "\n".join(bits) or "nothing recorded yet"
+
+
+con_global = None
 
 
 # ----------------------------------------------------------------------
 
 
 def main():
+    global con_global
     con = db()
+    con_global = con
     total_new = 0
     total_hits = 0
     parsed_anything = False
 
     # First ever run: learn what the market looks like without setting the
     # phone on fire. Everything gets graded and recorded, nothing is sent.
+    started = time.time()
     seeding = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 0
     if seeding:
         print("first run - building the price baseline, no alerts this time\n")
+        push("simwatch is up and running.\n\n"
+             "This first sweep is a quiet one: it reads every wheel currently "
+             "listed and works out what they normally go for. No alerts yet - "
+             "that would just be every listing at once.\n\n"
+             f"Watching {len(SEARCHES)} pages across bolha.com and njuskalo.hr.\n"
+             "You'll get another message when the baseline is ready.",
+             title="simwatch: starting up")
+        note_push(con)
 
     for site, url in SEARCHES:
+        if time.time() - started > MAX_RUNTIME_MIN * 60:
+            print(f"\nhit the {MAX_RUNTIME_MIN} minute budget, stopping here - "
+                  f"the rest gets picked up next run")
+            break
         try:
             page = fetch(url)
         except Exception as e:
@@ -1002,8 +1066,26 @@ def main():
     if seeding:
         n = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
         print(f"\nbaseline seeded with {n} listings. Next run starts alerting.")
+        push(f"Baseline ready - {n} wheels priced.\n\n"
+             f"{median_summary(con)}\n\n"
+             "From now on you'll only hear from me when something new turns up "
+             "that beats these prices. A named model has to be at or below the "
+             "median; an unidentified one has to be 30% under.\n\n"
+             "Silence means nothing good has been listed. I'll check in once a "
+             "day either way.",
+             title="simwatch: baseline ready")
+        note_push(con)
     else:
         print(f"\ndone: {total_new} new listings, {total_hits} worth your time")
+        gap = hours_since_last_push(con)
+        if gap is not None and gap >= HEARTBEAT_HOURS:
+            seen_total = con.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+            push(f"Still watching. Nothing worth your money in the last "
+                 f"{gap:.0f} hours.\n\n"
+                 f"{seen_total} listings checked all time.\n\n"
+                 f"{median_summary(con)}",
+                 title="simwatch: daily check-in", quiet=True)
+            note_push(con)
 
 
 if __name__ == "__main__":
