@@ -535,17 +535,24 @@ def verify_with_llm(listing, detail_text):
     try:
         if LLM_BASE_URL and LLM_MODEL:
             names = [m.strip() for m in LLM_MODEL.split(",") if m.strip()]
-            body = {"model": names[0], "max_tokens": 350, "temperature": 0,
-                    "messages": [{"role": "system", "content": VERIFY_SYSTEM},
-                                 {"role": "user", "content": prompt}]}
-            if len(names) > 1:
-                body["models"] = names        # OpenRouter tries these in order
-            r = post_with_retry(
-                f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
-                headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
-                         "Content-Type": "application/json"},
-                json=body, timeout=120)
-            text = r.json()["choices"][0]["message"]["content"]
+            text, last_err = None, None
+            for name in names:
+                try:
+                    r = post_with_retry(
+                        f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
+                        headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
+                                 "Content-Type": "application/json"},
+                        json={"model": name, "max_tokens": 350, "temperature": 0,
+                              "messages": [{"role": "system", "content": VERIFY_SYSTEM},
+                                           {"role": "user", "content": prompt}]},
+                        timeout=120)
+                    text = r.json()["choices"][0]["message"]["content"]
+                    break
+                except Exception as e:
+                    last_err = f"{name}: {api_message(e)}"
+                    print(f"  {last_err}")
+            if text is None:
+                raise RuntimeError(last_err or "all models failed")
         else:
             r = requests.post(
                 "https://api.anthropic.com/v1/messages",
@@ -560,7 +567,7 @@ def verify_with_llm(listing, detail_text):
                            if b.get("type") == "text")
         return parse_verdict(text)
     except Exception as e:
-        print(f"  verification unavailable ({str(e)[:70]})")
+        print(f"  verification unavailable: {api_message(e)}")
         return None
 
 
@@ -642,6 +649,21 @@ def judge_anthropic(listing, detail_text):
     text = "".join(b.get("text", "") for b in r.json().get("content", [])
                    if b.get("type") == "text")
     return parse_verdict(text)
+
+
+def api_message(exc):
+    """Pull the provider's own error text out of an HTTP error, because
+    '400 Bad Request for url: ***' tells you nothing useful."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return str(exc)[:160]
+    try:
+        j = resp.json()
+        msg = j.get("error", {})
+        msg = msg.get("message") if isinstance(msg, dict) else msg
+        return f"{resp.status_code} {msg or resp.text[:160]}"
+    except Exception:
+        return f"{resp.status_code} {resp.text[:160]}"
 
 
 def post_with_retry(url, **kw):
