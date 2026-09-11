@@ -144,7 +144,10 @@ MODEL = "claude-haiku-4-5-20251001"
 # LM Studio, llama.cpp and anything else with a /v1/chat/completions route.
 # Set these three and the Anthropic path is skipped entirely.
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")   # e.g. https://api.mistral.ai/v1
-LLM_MODEL = os.environ.get("LLM_MODEL", "")         # e.g. mistral-small-latest
+# Comma-separated list is allowed. On OpenRouter the extra names become
+# fallbacks: if the first model's shared pool is congested, it tries the next
+# one automatically instead of failing.
+LLM_MODEL = os.environ.get("LLM_MODEL", "")         # e.g. "a:free,b:free,c:free"
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")     # local servers: any string
 
 HEADERS = {
@@ -532,14 +535,17 @@ def verify_with_llm(listing, detail_text):
               f"description: {detail_text[:2500] or '(none available)'}")
     try:
         if LLM_BASE_URL and LLM_MODEL:
+            names = [m.strip() for m in LLM_MODEL.split(",") if m.strip()]
+            body = {"model": names[0], "max_tokens": 350, "temperature": 0,
+                    "messages": [{"role": "system", "content": VERIFY_SYSTEM},
+                                 {"role": "user", "content": prompt}]}
+            if len(names) > 1:
+                body["models"] = names        # OpenRouter tries these in order
             r = post_with_retry(
                 f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
                 headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
                          "Content-Type": "application/json"},
-                json={"model": LLM_MODEL, "max_tokens": 350, "temperature": 0,
-                      "messages": [{"role": "system", "content": VERIFY_SYSTEM},
-                                   {"role": "user", "content": prompt}]},
-                timeout=120)
+                json=body, timeout=120)
             text = r.json()["choices"][0]["message"]["content"]
         else:
             r = requests.post(
@@ -641,8 +647,8 @@ def judge_anthropic(listing, detail_text):
 
 def post_with_retry(url, **kw):
     """Free API tiers rate-limit hard. Honour Retry-After, back off, try again."""
-    delay = 3
-    for attempt in range(2):
+    delay = 5
+    for attempt in range(3):
         r = requests.post(url, **kw)
         if r.status_code != 429:
             r.raise_for_status()
@@ -660,7 +666,7 @@ def judge_openai_compatible(listing, detail_text):
         f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
                  "Content-Type": "application/json"},
-        json={"model": LLM_MODEL,
+        json={"model": LLM_MODEL.split(",")[0].strip(),
               "max_tokens": 400,
               "temperature": 0,
               "messages": [{"role": "system", "content": SYSTEM},
