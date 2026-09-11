@@ -175,7 +175,7 @@ def db():
     return con
 
 
-def fingerprint(title, price):
+def fingerprint(title, price, site=""):
     """Same wheel relisted next week gets a fresh listing id but keeps its
     wording. Normalise hard and bucket the price so a 210 -> 200 price drop
     still counts as the same ad."""
@@ -184,11 +184,11 @@ def fingerprint(title, price):
             "zelo", "malo", "in", "z", "s", "za", "the", "komplet", "set"}
     words = sorted(w for w in words if w not in stop and len(w) > 2)
     bucket = int(price // 25) if price else -1
-    return " ".join(words[:8]) + f"|{bucket}"
+    return f"{site}|" + " ".join(words[:8]) + f"|{bucket}"
 
 
 def is_repost(con, listing, days=60):
-    fp = fingerprint(listing["title"], listing["price"])
+    fp = fingerprint(listing["title"], listing["price"], listing["site"])
     cutoff = int(time.time()) - days * 86400
     row = con.execute("SELECT url, ts FROM reposts WHERE fp=? AND ts>?",
                       (fp, cutoff)).fetchone()
@@ -199,7 +199,7 @@ def is_repost(con, listing, days=60):
 
 def remember_fingerprint(con, listing):
     con.execute("INSERT OR REPLACE INTO reposts VALUES (?,?,?)",
-                (fingerprint(listing["title"], listing["price"]),
+                (fingerprint(listing["title"], listing["price"], listing["site"]),
                  listing["url"], int(time.time())))
     con.commit()
 
@@ -343,7 +343,7 @@ PEDALS = re.compile(r"\b(stopalk\w*|pedal\w*|papučic\w*)\b", re.I)
 # "za xbox one in xbox series" never says "only", but if a listing names a
 # console and never mentions PC, and the brand is not a known PC-compatible
 # one, it is a console wheel.
-CONSOLE_WORD = re.compile(r"\b(xbox|playstation|ps ?[12345])\b", re.I)
+CONSOLE_WORD = re.compile(r"\b(xbox|playstation|ps ?[12345]|nintendo|switch|wii|gamecube)\b", re.I)
 PC_WORD = re.compile(r"\b(pc|windows|računalnik\w*|racunalnik\w*|steam)\b", re.I)
 HANDBRAKE = re.compile(r"\b(ro[cč]n\w* zavor\w*|ru[cč]n\w* ko[cč]nic\w*|handbrake|hand brake)\b", re.I)
 SHIFTER = re.compile(r"\b(menjalnik\w*|shifter|mjenja[cč]\w*)\b", re.I)
@@ -385,7 +385,8 @@ WHEEL_WORD = re.compile(r"\b(volan\w*|kormilo|steering wheel|wheel|volant)\b", r
 # Cheap non-force-feedback toys. They technically have a wheel and pedals but
 # they are not what anyone means by a sim rig.
 JUNK_BRANDS = re.compile(r"\b(speedlink|tracer|overdrive|esperanza|genesis seaborg|"
-                         r"trust gxt|natec|defender|subsonic|ff380)\b", re.I)
+                         r"trust gxt|gxt \d+|natec|defender|subsonic|ff380|"
+                         r"hori|mario kart|spawn|readygo|pxn|serafim)\b", re.I)
 
 # A stand or cockpit is not a wheel, even though the words appear.
 STAND_ONLY = re.compile(r"\b(stalak|držač|drzac|stojalo|nosilec|držalo|drzalo|"
@@ -940,10 +941,17 @@ def main():
              title="simwatch: starting up")
         note_push(con)
 
-    for site, url in SEARCHES:
+    # Start where the last run stopped, so a truncated sweep doesn't mean the
+    # tail of the list is never checked.
+    row = con.execute("SELECT v FROM health WHERE k='rotate'").fetchone()
+    offset = int(row[0]) % len(SEARCHES) if row else 0
+    ordered = SEARCHES[offset:] + SEARCHES[:offset]
+    done_count = 0
+
+    for site, url in ordered:
         if time.time() - started > MAX_RUNTIME_MIN * 60:
             print(f"\nhit the {MAX_RUNTIME_MIN} minute budget, stopping here - "
-                  f"the rest gets picked up next run")
+                  f"next run resumes at source {(offset + done_count) % len(SEARCHES)}")
             break
         try:
             page = fetch(url)
@@ -1052,6 +1060,10 @@ def main():
 
             time.sleep(2)
 
+        done_count += 1
+        con.execute("INSERT OR REPLACE INTO health VALUES ('rotate', ?)",
+                    (str((offset + done_count) % len(SEARCHES)),))
+        con.commit()
         time.sleep(10)   # be gentle between search pages
 
     # fail loudly instead of going quiet for weeks after a site redesign

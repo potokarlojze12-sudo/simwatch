@@ -169,7 +169,7 @@ def geocode(con, place, site):
     try:
         time.sleep(1.1)  # Nominatim asks for max 1 request/second
         r = requests.get(NOMINATIM, headers=UA, timeout=30, params={
-            "q": place, "country": country, "format": "json", "limit": 1})
+            "q": f"{place}, {country}", "format": "json", "limit": 1})
         r.raise_for_status()
         hits = r.json()
     except Exception as e:
