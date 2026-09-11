@@ -84,9 +84,9 @@ SEARCHES = [
     ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=thrustmaster"),
     ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=fanatec"),
     ("bolha", "https://www.bolha.com/?ctl=search_ads&keywords=igralni+volan"),
-    ("salomon", "https://www.salomon.si/iskanje?q=volan%20pedala"),
-    ("salomon", "https://www.salomon.si/iskanje?q=sim%20racing"),
-    ("salomon", "https://www.salomon.si/iskanje?q=igralni%20volan"),
+    # salomon.si is deliberately absent: its robots.txt disallows automated
+    # access, so the polite move is to check that one by hand. Their site has
+    # its own search you can bookmark.
     # Croatia. Same company as Bolha, same page template. With the cap at
     # 150 km the whole Zagreb area is in range, which is where the actual
     # sim racing market is. Croatian hits get toll money added on top.
@@ -252,10 +252,12 @@ def extract_listings(site, page_html, base_url):
     out = {}
 
     # site-specific hint for what a listing link looks like
+    # Must end in -oglas-<digits>. Plain "/oglas" also matched /oglasevanje,
+    # /oglasi-skupnost and every other footer link on the page.
     patterns = {
-        "bolha": re.compile(r"/oglas|/[a-z0-9\-]+-oglas-\d+|/ad/\d+"),
+        "bolha": re.compile(r"-oglas-\d{4,}"),
         "salomon": re.compile(r"/oglas|/oglasi/|/artikel/"),
-        "njuskalo": re.compile(r"/oglas|/[a-z0-9\-]+-oglas-\d+"),
+        "njuskalo": re.compile(r"-oglas-\d{4,}"),
     }
     pat = patterns.get(site, re.compile(r"/oglas"))
 
@@ -318,7 +320,7 @@ PEDALS = re.compile(r"\b(stopalk\w*|pedal\w*|papučic\w*)\b", re.I)
 # "za xbox one in xbox series" never says "only", but if a listing names a
 # console and never mentions PC, and the brand is not a known PC-compatible
 # one, it is a console wheel.
-CONSOLE_WORD = re.compile(r"\b(xbox|playstation|ps ?[345])\b", re.I)
+CONSOLE_WORD = re.compile(r"\b(xbox|playstation|ps ?[12345])\b", re.I)
 PC_WORD = re.compile(r"\b(pc|windows|računalnik\w*|racunalnik\w*|steam)\b", re.I)
 HANDBRAKE = re.compile(r"\b(ro[cč]n\w* zavor\w*|ru[cč]n\w* ko[cč]nic\w*|handbrake|hand brake)\b", re.I)
 SHIFTER = re.compile(r"\b(menjalnik\w*|shifter|mjenja[cč]\w*)\b", re.I)
@@ -329,12 +331,23 @@ WANTED_JUNK = re.compile(r"\b(otro[sš]k\w+|igra[cč]\w*|traktor\w*|avtodom\w*|"
                          r"bicikl\w*|kosilnic\w*|[cč]oln\w*)\b", re.I)
 
 TIERS = [
-    ("high", re.compile(r"\b(fanatec (dd|podium|csl dd)|moza (r5|r9|r12|r16|r21)|"
-                        r"simucube|simagic|asetek|vrs direct|cammus)\b", re.I)),
-    ("mid",  re.compile(r"\b(t300|t500|ts-?xw|ts-?pc|csl elite|clubsport|"
-                        r"logitech pro|g pro (wheel|racing))\b", re.I)),
-    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|t150|t128|t248|tmx|driving force)\b", re.I)),
+    ("high", re.compile(r"\b(fanatec (dd|dd\+|podium|csl dd)|dd1|dd2|moza (r3|r5|r9|r12|r16|r21)|"
+                        r"simucube|simagic|asetek|vrs direct|cammus|t598|t818|"
+                        r"direct drive|dirketni pogon)\b", re.I)),
+    ("mid",  re.compile(r"\b(t300|t500|ts-?xw|ts-?pc|csl elite|clubsport|csr|"
+                        r"logitech pro|g pro (wheel|racing)|t-?gt)\b", re.I)),
+    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|t150|t128|t248|tmx|"
+                         r"driving force|force feedback|ffb)\b", re.I)),
 ]
+
+# Cheap non-force-feedback toys. They technically have a wheel and pedals but
+# they are not what anyone means by a sim rig.
+JUNK_BRANDS = re.compile(r"\b(speedlink|tracer|overdrive|esperanza|genesis seaborg|"
+                         r"trust gxt|natec|defender|subsonic|ff380)\b", re.I)
+
+# A stand or cockpit is not a wheel, even though the words appear.
+STAND_ONLY = re.compile(r"\b(stalak|držač|drzac|stojalo|nosilec|držalo|drzalo|"
+                        r"playseat|rig|kokpit|cockpit)\b", re.I)
 
 TOWNS = re.compile(
     r"\b(Ljubljana|Maribor|Celje|Kranj|Koper|Velenje|Novo mesto|Ptuj|Trbovlje|"
@@ -355,8 +368,11 @@ def local_judge(listing, detail_text=""):
         return {"match": False, "deal_score": 1, "reason": "broken / for parts / wanted ad"}
     if CONSOLE_ONLY.search(blob):
         return {"match": False, "deal_score": 1, "reason": "console only"}
-    if WANTED_JUNK.search(blob):
+    if WANTED_JUNK.search(blob) or JUNK_BRANDS.search(blob):
         return {"match": False, "deal_score": 1, "reason": "toy / wrong kind of wheel"}
+    named_model = any(rx.search(blob) for _, rx in TIERS)
+    if STAND_ONLY.search(blob) and not named_model:
+        return {"match": False, "deal_score": 1, "reason": "stand or rig, not a wheel"}
     if NO_PEDALS.search(blob):
         return {"match": False, "deal_score": 1, "reason": "explicitly sold without pedals"}
 
@@ -365,6 +381,9 @@ def local_judge(listing, detail_text=""):
         return {"match": False, "deal_score": 1, "reason": "no pedals mentioned"}
 
     tier, model = "unknown", None
+    if (CONSOLE_WORD.search(blob) and not PC_WORD.search(blob)
+            and not any(rx.search(blob) for _, rx in TIERS)):
+        return {"match": False, "deal_score": 1, "reason": "console only"}
     for name, rx in TIERS:
         m = rx.search(blob)
         if m:
@@ -372,13 +391,13 @@ def local_judge(listing, detail_text=""):
             break
 
     has_hb = bool(HANDBRAKE.search(blob))
-    score = 3
+    score = 3                      # a wheel with pedals clears the bar by default
     if has_hb:
         score += 1
     if SHIFTER.search(blob):
         score += 1
-    if tier == "unknown":
-        score -= 1
+    if tier == "high":
+        score += 1                 # direct drive with pedals is always worth a look
     score = max(1, min(5, score))
 
     town = TOWNS.search(blob)
@@ -474,8 +493,24 @@ def judge_anthropic(listing, detail_text):
     return parse_verdict(text)
 
 
+def post_with_retry(url, **kw):
+    """Free API tiers rate-limit hard. Honour Retry-After, back off, try again."""
+    delay = 4
+    for attempt in range(4):
+        r = requests.post(url, **kw)
+        if r.status_code != 429:
+            r.raise_for_status()
+            return r
+        wait = int(r.headers.get("Retry-After") or delay)
+        print(f"  rate limited, waiting {wait}s (attempt {attempt + 1}/4)")
+        time.sleep(wait)
+        delay *= 2
+    r.raise_for_status()
+    return r
+
+
 def judge_openai_compatible(listing, detail_text):
-    r = requests.post(
+    r = post_with_retry(
         f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
                  "Content-Type": "application/json"},
@@ -486,7 +521,6 @@ def judge_openai_compatible(listing, detail_text):
                            {"role": "user",
                             "content": build_prompt(listing, detail_text)}]},
         timeout=120)  # local models on a laptop can be slow
-    r.raise_for_status()
     return parse_verdict(r.json()["choices"][0]["message"]["content"])
 
 
@@ -684,6 +718,16 @@ def main():
             continue
 
         listings = extract_listings(site, page, url)
+        if not listings:
+            # an empty result mid-run usually means throttling, not an empty
+            # category. Wait it out and ask once more before giving up.
+            print(f"[{site}] empty result, backing off 20s and retrying")
+            time.sleep(20)
+            try:
+                page = fetch(url)
+                listings = extract_listings(site, page, url)
+            except Exception as e:
+                print(f"[{site}] retry failed: {e}")
         print(f"[{site}] {len(listings)} listings on {url}")
         if listings:
             parsed_anything = True
@@ -769,7 +813,7 @@ def main():
 
             time.sleep(2)
 
-        time.sleep(3)
+        time.sleep(10)   # be gentle between search pages
 
     # fail loudly instead of going quiet for weeks after a site redesign
     prev = con.execute("SELECT v FROM health WHERE k='dry_runs'").fetchone()
