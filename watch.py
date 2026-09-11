@@ -115,6 +115,15 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 DB_PATH = os.environ.get("SIMWATCH_DB", "seen.db")
 MODEL = "claude-haiku-4-5-20251001"
 
+# --- Any other LLM -----------------------------------------------------
+# Almost every provider speaks the OpenAI chat-completions format, so one
+# code path covers Mistral, Groq, OpenRouter, DeepSeek, OpenAI, Ollama,
+# LM Studio, llama.cpp and anything else with a /v1/chat/completions route.
+# Set these three and the Anthropic path is skipped entirely.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")   # e.g. https://api.mistral.ai/v1
+LLM_MODEL = os.environ.get("LLM_MODEL", "")         # e.g. mistral-small-latest
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")     # local servers: any string
+
 HEADERS = {
     "User-Agent": "simwatch/1.0 (personal listing watcher; low volume)",
     "Accept-Language": "sl-SI,sl;q=0.9,en;q=0.8",
@@ -292,6 +301,99 @@ def extract_listings(site, page_html, base_url):
 # the smart bit
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# offline filter - used automatically when no ANTHROPIC_API_KEY is set.
+# Dumber than Claude, free, and needs no account. Catches the obvious stuff.
+# ----------------------------------------------------------------------
+
+DEALBREAKERS = re.compile(
+    r"\b(za dele|ne dela|ne deluje|okvarjen|pokvarjen|neispravan|za dijelove|"
+    r"kupim|iscem|iščem|isc?em|tražim|trazim|povprasevanje)\b", re.I)
+
+CONSOLE_ONLY = re.compile(
+    r"\b(samo za (ps[45]|playstation|xbox)|ps[45] only|xbox only|"
+    r"ne dela na pc|ni za pc|samo playstation|samo xbox)\b", re.I)
+
+PEDALS = re.compile(r"\b(stopalk\w*|pedal\w*|papučic\w*)\b", re.I)
+# "za xbox one in xbox series" never says "only", but if a listing names a
+# console and never mentions PC, and the brand is not a known PC-compatible
+# one, it is a console wheel.
+CONSOLE_WORD = re.compile(r"\b(xbox|playstation|ps ?[345])\b", re.I)
+PC_WORD = re.compile(r"\b(pc|windows|računalnik\w*|racunalnik\w*|steam)\b", re.I)
+HANDBRAKE = re.compile(r"\b(ro[cč]n\w* zavor\w*|ru[cč]n\w* ko[cč]nic\w*|handbrake|hand brake)\b", re.I)
+SHIFTER = re.compile(r"\b(menjalnik\w*|shifter|mjenja[cč]\w*)\b", re.I)
+# Slovenian says "brez stopalk" = WITHOUT pedals. Without this the word
+# "stopalk" alone would score it as if the pedals were included.
+NO_PEDALS = re.compile(r"\b(brez|bez)\s+(stopalk\w*|pedal\w*|papu[cč]ic\w*)", re.I)
+WANTED_JUNK = re.compile(r"\b(otro[sš]k\w+|igra[cč]\w*|traktor\w*|avtodom\w*|"
+                         r"bicikl\w*|kosilnic\w*|[cč]oln\w*)\b", re.I)
+
+TIERS = [
+    ("high", re.compile(r"\b(fanatec (dd|podium|csl dd)|moza (r5|r9|r12|r16|r21)|"
+                        r"simucube|simagic|asetek|vrs direct|cammus)\b", re.I)),
+    ("mid",  re.compile(r"\b(t300|t500|ts-?xw|ts-?pc|csl elite|clubsport|"
+                        r"logitech pro|g pro (wheel|racing))\b", re.I)),
+    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|t150|t128|t248|tmx|driving force)\b", re.I)),
+]
+
+TOWNS = re.compile(
+    r"\b(Ljubljana|Maribor|Celje|Kranj|Koper|Velenje|Novo mesto|Ptuj|Trbovlje|"
+    r"Kamnik|Jesenice|Nova Gorica|Domžale|Škofja Loka|Murska Sobota|Postojna|"
+    r"Grosuplje|Vrhnika|Litija|Krško|Brežice|Slovenj Gradec|Ravne|Idrija|Ajdovščina|"
+    r"Sežana|Izola|Piran|Portorož|Ilirska Bistrica|Logatec|Cerknica|Ribnica|Kočevje|"
+    r"Trebnje|Zagorje|Hrastnik|Sevnica|Lendava|Ormož|Slovenska Bistrica|Radovljica|"
+    r"Bled|Bohinj|Tolmin|Bovec|Zagreb|Karlovac|Varaždin|Rijeka|Samobor|Sisak|Krapina)\b")
+
+
+def local_judge(listing, detail_text=""):
+    """Keyword filter. No API key, no account, no ID scan. Roughly 80% as good
+    as Claude on obvious listings and noticeably worse on vague ones, so it
+    leans cautious: anything it can't confirm has pedals gets rejected."""
+    blob = f"{listing['title']} {detail_text}"
+
+    if DEALBREAKERS.search(blob):
+        return {"match": False, "deal_score": 1, "reason": "broken / for parts / wanted ad"}
+    if CONSOLE_ONLY.search(blob):
+        return {"match": False, "deal_score": 1, "reason": "console only"}
+    if WANTED_JUNK.search(blob):
+        return {"match": False, "deal_score": 1, "reason": "toy / wrong kind of wheel"}
+    if NO_PEDALS.search(blob):
+        return {"match": False, "deal_score": 1, "reason": "explicitly sold without pedals"}
+
+    has_pedals = bool(PEDALS.search(blob))
+    if not has_pedals:
+        return {"match": False, "deal_score": 1, "reason": "no pedals mentioned"}
+
+    tier, model = "unknown", None
+    for name, rx in TIERS:
+        m = rx.search(blob)
+        if m:
+            tier, model = name, m.group(0)
+            break
+
+    has_hb = bool(HANDBRAKE.search(blob))
+    score = 3
+    if has_hb:
+        score += 1
+    if SHIFTER.search(blob):
+        score += 1
+    if tier == "unknown":
+        score -= 1
+    score = max(1, min(5, score))
+
+    town = TOWNS.search(blob)
+    msg = ("Zivjo, me zanima ce je volan se na voljo? Ali stopalke delujejo brez "
+           "tezav in ali komplet deluje na PC? Lahko pridem osebno po njega in "
+           "placam z gotovino. Hvala za odgovor!")
+
+    return {"match": True, "deal_score": score, "has_pedals": True,
+            "has_handbrake": has_hb, "pc_compatible": None,
+            "guessed_model": model, "tier": tier,
+            "location": town.group(0) if town else None,
+            "opening_message": msg,
+            "reason": f"keyword match{' + handbrake' if has_hb else ''} (offline filter)"}
+
+
 SYSTEM = """You screen used-marketplace listings for a buyer in Slovenia.
 Listings are in Slovenian. You will be given what the buyer wants, then one listing.
 
@@ -330,43 +432,109 @@ Useful Slovenian: 'volan'=wheel, 'stopalke'/'pedala'=pedals, 'ročna zavora'=han
 'kupim'/'iščem'=wanted ad, 'komplet'=set/bundle."""
 
 
-def judge(listing, detail_text=""):
-    if not ANTHROPIC_API_KEY:
-        return {"match": True, "deal_score": 3, "reason": "no API key, passing everything through"}
-
-    body = {
-        "model": MODEL,
-        "max_tokens": 400,
-        "system": SYSTEM,
-        "messages": [{
-            "role": "user",
-            "content": (
-                f"BUYER WANTS:\n{WANT}\n\n"
-                f"LISTING:\nsite: {listing['site']}\n"
-                f"title: {listing['title']}\n"
-                f"price: {listing['price']} EUR\n"
-                f"url: {listing['url']}\n"
-                f"description: {detail_text[:3000] or '(none fetched)'}"
-            ),
-        }],
-    }
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json=body,
-        timeout=60,
+def build_prompt(listing, detail_text):
+    return (
+        f"BUYER WANTS:\n{WANT}\n\n"
+        f"LISTING:\nsite: {listing['site']}\n"
+        f"title: {listing['title']}\n"
+        f"price: {listing['price']} EUR\n"
+        f"url: {listing['url']}\n"
+        f"description: {detail_text[:3000] or '(none fetched)'}"
     )
-    r.raise_for_status()
-    text = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
-    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
+def parse_verdict(text):
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].rsplit("```", 1)[0]
+    # some models wrap the JSON in chatter - grab the outermost object
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        text = text[start:end + 1]
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"match": False, "deal_score": 1, "reason": f"unparseable model reply: {text[:120]}"}
+        return {"match": False, "deal_score": 1,
+                "reason": f"unparseable model reply: {text[:120]}"}
+
+
+def judge_anthropic(listing, detail_text):
+    r = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={"x-api-key": ANTHROPIC_API_KEY,
+                 "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+        json={"model": MODEL, "max_tokens": 400, "system": SYSTEM,
+              "messages": [{"role": "user",
+                            "content": build_prompt(listing, detail_text)}]},
+        timeout=60)
+    r.raise_for_status()
+    text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                   if b.get("type") == "text")
+    return parse_verdict(text)
+
+
+def judge_openai_compatible(listing, detail_text):
+    r = requests.post(
+        f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
+                 "Content-Type": "application/json"},
+        json={"model": LLM_MODEL,
+              "max_tokens": 400,
+              "temperature": 0,
+              "messages": [{"role": "system", "content": SYSTEM},
+                           {"role": "user",
+                            "content": build_prompt(listing, detail_text)}]},
+        timeout=120)  # local models on a laptop can be slow
+    r.raise_for_status()
+    return parse_verdict(r.json()["choices"][0]["message"]["content"])
+
+
+def sanity_check(verdict, listing, detail_text):
+    """Small models omit fields and miss obvious rejects. Fill the gaps from
+    the keyword filter and veto anything that breaks a hard requirement,
+    whatever the model claimed."""
+    blob = f"{listing['title']} {detail_text}"
+
+    if not verdict.get("tier") or verdict.get("tier") == "unknown":
+        verdict["tier"] = "unknown"
+        for name, rx in TIERS:
+            if rx.search(blob):
+                verdict["tier"] = name
+                if not verdict.get("guessed_model"):
+                    verdict["guessed_model"] = rx.search(blob).group(0)
+                break
+
+    console_no_pc = (CONSOLE_WORD.search(blob) and not PC_WORD.search(blob)
+                     and verdict["tier"] == "unknown")
+    if CONSOLE_ONLY.search(blob) or console_no_pc:
+        verdict.update(match=False, deal_score=1, reason="console only (veto)")
+    elif NO_PEDALS.search(blob):
+        verdict.update(match=False, deal_score=1, reason="sold without pedals (veto)")
+    elif DEALBREAKERS.search(blob):
+        verdict.update(match=False, deal_score=1, reason="broken / wanted ad (veto)")
+
+    if verdict.get("has_handbrake") is None:
+        verdict["has_handbrake"] = bool(HANDBRAKE.search(blob))
+    if verdict.get("location") is None:
+        m = TOWNS.search(blob)
+        verdict["location"] = m.group(0) if m else None
+    return verdict
+
+
+def judge(listing, detail_text=""):
+    """Whichever brain is configured. Falls back to the offline keyword
+    filter rather than crashing, so a dead API never stops the watcher."""
+    try:
+        if LLM_BASE_URL and LLM_MODEL:
+            return sanity_check(judge_openai_compatible(listing, detail_text),
+                                listing, detail_text)
+        if ANTHROPIC_API_KEY:
+            return sanity_check(judge_anthropic(listing, detail_text),
+                                listing, detail_text)
+    except Exception as e:
+        print(f"  LLM call failed ({e}) - using offline filter for this one")
+    return local_judge(listing, detail_text)
 
 
 # ----------------------------------------------------------------------
@@ -502,6 +670,12 @@ def main():
     total_hits = 0
     parsed_anything = False
 
+    # First ever run: learn what the market looks like without setting the
+    # phone on fire. Everything gets graded and recorded, nothing is sent.
+    seeding = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0] == 0
+    if seeding:
+        print("first run - building the price baseline, no alerts this time\n")
+
     for site, url in SEARCHES:
         try:
             page = fetch(url)
@@ -574,13 +748,24 @@ def main():
                 time.sleep(2)
                 continue
 
-            cheap = med is None or (l["price"] and l["price"] <= med * UNDERCUT_FACTOR)
+            if l["price"] is None:
+                print(f"  no price listed, skipping: {l['title'][:50]}")
+                time.sleep(2)
+                continue
+
+            if seeding:
+                print(f"  seeded {tier:7} {l['price']:.0f} EUR  {l['title'][:45]}")
+                time.sleep(2)
+                continue
+
+            cheap = med is None or l["price"] <= med * UNDERCUT_FACTOR
             if cheap or score >= ALWAYS_NOTIFY_SCORE:
                 total_hits += 1
                 notify(l, verdict, med, n, ride)
             else:
+                shown = f"{l['price']:.0f}" if l["price"] else "no price"
                 print(f"  matched but pricey: {l['title'][:50]} "
-                      f"{l['price']:.0f} vs {med:.0f} median ({tier})")
+                      f"{shown} vs {med:.0f} median ({tier})")
 
             time.sleep(2)
 
@@ -595,7 +780,11 @@ def main():
         alert_plain("simwatch: parsed 0 listings 3 runs in a row. "
                     "Site markup probably changed - check debug_*.html")
 
-    print(f"\ndone: {total_new} new listings, {total_hits} worth your time")
+    if seeding:
+        n = con.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        print(f"\nbaseline seeded with {n} listings. Next run starts alerting.")
+    else:
+        print(f"\ndone: {total_new} new listings, {total_hits} worth your time")
 
 
 if __name__ == "__main__":
