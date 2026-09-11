@@ -100,24 +100,12 @@ HEARTBEAT_HOURS = 24
 # Categories first - they are stable, and bolha has one called literally
 # "Volani in pedala". Searches second, because the URL format moves around:
 # the old ?ctl=search_ads silently stopped searching and served a generic page.
+# Deliberately short. These two are the only pages that ever returned real
+# wheels; the rest were noise even when they worked. Four requests an hour
+# instead of seventy-two is the difference between a watcher and a nuisance.
 SEARCHES = [
-    # --- the bullseye
     ("bolha", "https://www.bolha.com/volani-in-pedala-pc"),
     ("njuskalo", "https://www.njuskalo.hr/gaming-oprema"),
-
-    # --- neighbouring categories, for sellers who filed it wrong
-    ("bolha", "https://www.bolha.com/gamepad-i-pc"),
-    ("bolha", "https://www.bolha.com/pc-dodatki"),
-    ("bolha", "https://www.bolha.com/ostale-konzole"),
-    ("njuskalo", "https://www.njuskalo.hr/pc-igre"),
-    ("njuskalo", "https://www.njuskalo.hr/igrace-konzole"),
-    ("njuskalo", "https://www.njuskalo.hr/informatika-sve-ostalo"),
-
-    # --- searches, to catch anything filed somewhere unexpected entirely
-    ("bolha", "https://www.bolha.com/search/?keywords=volan+pedala"),
-    ("bolha", "https://www.bolha.com/search/?keywords=igralni+volan"),
-    ("bolha", "https://www.bolha.com/search/?keywords=fanatec"),
-    ("njuskalo", "https://www.njuskalo.hr/search/?keywords=volan+pedale"),
 ]
 
 # Secrets come from environment variables. Never hardcode them here.
@@ -248,6 +236,17 @@ def mark_seen(con, listing, score):
 # ----------------------------------------------------------------------
 
 PRICE_RE = re.compile(r"(\d[\d\.\s]*(?:,\d{1,2})?)\s*(?:€|EUR)", re.I)
+
+# Both sites sit behind the same bot-detection vendor. When it challenges us
+# the response is a captcha page, not listings. Treat that as a stop sign:
+# the site is asking us not to, so we stop for the rest of the run.
+BLOCK_PAGE = re.compile(
+    r"<title>[^<]*(captcha|bot manager|shieldsquare|access denied)[^<]*</title>|"
+    r"perfdrive\.com|radware", re.I)
+
+
+def is_blocked(page_html):
+    return bool(BLOCK_PAGE.search(page_html[:4000]))
 
 
 def parse_price(text):
@@ -965,17 +964,18 @@ def main():
             print(f"[{site}] fetch failed {url}: {e}")
             continue
 
+        if is_blocked(page):
+            print(f"[{site}] served a bot-check page. That is the site asking "
+                  f"us not to, so this run stops here.")
+            alert_plain(f"simwatch: {site} served a bot check and the run was "
+                        f"stopped. If this keeps happening, the site does not "
+                        f"want automated access and the app's own saved-search "
+                        f"alerts are the way to go.")
+            break
+
         listings = extract_listings(site, page, url)
         if not listings:
-            # an empty result mid-run usually means throttling, not an empty
-            # category. Wait it out and ask once more before giving up.
-            print(f"[{site}] empty result, backing off 20s and retrying")
-            time.sleep(20)
-            try:
-                page = fetch(url)
-                listings = extract_listings(site, page, url)
-            except Exception as e:
-                print(f"[{site}] retry failed: {e}")
+            print(f"[{site}] no listings found - page may have changed")
         print(f"[{site}] {len(listings)} listings on {url}")
         if listings:
             parsed_anything = True
@@ -1070,7 +1070,7 @@ def main():
         con.execute("INSERT OR REPLACE INTO health VALUES ('rotate', ?)",
                     (str((offset + done_count) % len(SEARCHES)),))
         con.commit()
-        time.sleep(10)   # be gentle between search pages
+        time.sleep(20)   # unhurried: two pages an hour is not a race
 
     # fail loudly instead of going quiet for weeks after a site redesign
     prev = con.execute("SELECT v FROM health WHERE k='dry_runs'").fetchone()
