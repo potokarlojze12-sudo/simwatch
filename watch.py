@@ -66,7 +66,11 @@ NOTIFY_MIN_SCORE = 3       # only ping me for deal_score >= this (1-5)
 # earns a ping if it undercuts the running median for its tier of wheel.
 # Comparing a G29 against a Fanatec DD would be meaningless, so prices are
 # tracked separately per tier.
-UNDERCUT_FACTOR = 1.00     # 1.00 = at or below median. 0.90 = 10% below median.
+# Two lanes. A named model we can price confidently, so at or below median is
+# enough. An unidentified wheel might be anything, so it has to be a genuine
+# steal before it earns a buzz.
+UNDERCUT_FACTOR = 1.00        # known model: at or below median
+UNKNOWN_UNDERCUT = 0.70       # unidentified: must be 30% under
 MIN_SAMPLES_FOR_MEDIAN = 5 # below this, no baseline exists yet -> notify anyway
 ALWAYS_NOTIFY_SCORE = 5    # a 5/5 gets through even if it's above median
 
@@ -327,18 +331,37 @@ SHIFTER = re.compile(r"\b(menjalnik\w*|shifter|mjenja[cč]\w*)\b", re.I)
 # Slovenian says "brez stopalk" = WITHOUT pedals. Without this the word
 # "stopalk" alone would score it as if the pedals were included.
 NO_PEDALS = re.compile(r"\b(brez|bez)\s+(stopalk\w*|pedal\w*|papu[cč]ic\w*)", re.I)
-WANTED_JUNK = re.compile(r"\b(otro[sš]k\w+|igra[cč]\w*|traktor\w*|avtodom\w*|"
-                         r"bicikl\w*|kosilnic\w*|[cč]oln\w*)\b", re.I)
+WANTED_JUNK = re.compile(
+    r"\b(otro[sš]k\w+|igra[cč]\w*|traktor\w*|avtodom\w*|kosilnic\w*|[cč]oln\w*|"
+    # bicycles. "kolo" needs exact endings or it eats kolona/okolica/kolut
+    r"kolo|kolesa|kolesu|kolesom|kolesarsk\w*|bicikl\w*|bicikel|rog pony|"
+    r"elektri[cč]n\w* kolo|zlo[zž]ljiv\w*|skiro\w*|monocikl\w*)\b", re.I)
 
 TIERS = [
     ("high", re.compile(r"\b(fanatec (dd|dd\+|podium|csl dd)|dd1|dd2|moza (r3|r5|r9|r12|r16|r21)|"
                         r"simucube|simagic|asetek|vrs direct|cammus|t598|t818|"
                         r"direct drive|dirketni pogon)\b", re.I)),
     ("mid",  re.compile(r"\b(t300|t500|ts-?xw|ts-?pc|csl elite|clubsport|csr|"
-                        r"logitech pro|g pro (wheel|racing)|t-?gt)\b", re.I)),
-    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|t150|t128|t248|tmx|"
-                         r"driving force|force feedback|ffb)\b", re.I)),
+                        r"logitech pro|g pro (wheel|racing)|t-?gt|"
+                        r"csl(?! dd)|accuforce|g940)\b", re.I)),
+    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|g" r"29|t150|t128|t248|tmx|"
+                         r"t3pa|driving force|force feedback|ffb|"
+                         r"momo racing|dfgt|wingman)\b", re.I)),
 ]
+
+# The strongest signal available and I was ignoring it: bolha puts the
+# category in the URL. /elektricna-kolesa/ and /zlozljiva-kolesa/ are bicycle
+# sections. A sim wheel is never listed there.
+BAD_CATEGORY = re.compile(
+    r"/(elektricna-kolesa|zlozljiva-kolesa|gorska-kolesa|cestna-kolesa|kolesa|"
+    r"bicikli|motorna-kolesa|mopedi|skuterji|avtomobili|osebni-avtomobili|"
+    r"tovorna-vozila|prikolice|plovila|coln|nepremicnine|stanovanja|hise|"
+    r"obutev|oblacila|pohistvo|otroska|igrace|vrt|kmetijstvo|zivali|"
+    r"gospodinjski|kozmetika|knjige|glasbila|nakit|ure)/", re.I)
+
+# A sim rig has a wheel. Pedals alone match bicycles, sewing machines and
+# pianos. Note \bwheel\b deliberately does not match "isinwheel".
+WHEEL_WORD = re.compile(r"\b(volan\w*|kormilo|steering wheel|wheel|volant)\b", re.I)
 
 # Cheap non-force-feedback toys. They technically have a wheel and pedals but
 # they are not what anyone means by a sim rig.
@@ -358,12 +381,45 @@ TOWNS = re.compile(
     r"Bled|Bohinj|Tolmin|Bovec|Zagreb|Karlovac|Varaždin|Rijeka|Samobor|Sisak|Krapina)\b")
 
 
+# bolha often gives only a region ("Osrednjeslovenska"), not a town. Map each
+# to its main city so the distance estimate still works, roughly.
+REGIONS = {
+    "osrednjeslovenska": "Ljubljana", "gorenjska": "Kranj",
+    "podravska": "Maribor", "savinjska": "Celje", "obalno-kraška": "Koper",
+    "obalno-kraska": "Koper", "goriška": "Nova Gorica", "goriska": "Nova Gorica",
+    "jugovzhodna slovenija": "Novo mesto", "dolenjska": "Novo mesto",
+    "pomurska": "Murska Sobota", "koroška": "Slovenj Gradec",
+    "koroska": "Slovenj Gradec", "zasavska": "Trbovlje",
+    "posavska": "Krško", "spodnjeposavska": "Krško",
+    "primorsko-notranjska": "Postojna", "notranjska": "Postojna",
+    "primorska": "Koper", "štajerska": "Maribor", "stajerska": "Maribor",
+}
+REGION_RX = re.compile("|".join(REGIONS), re.I)
+
+
+def find_location(blob):
+    """Prefer a named town. Fall back to the region's main city."""
+    m = TOWNS.search(blob)
+    if m:
+        return m.group(0)
+    m = REGION_RX.search(blob)
+    if m:
+        return REGIONS.get(m.group(0).lower())
+    return None
+
+
 def local_judge(listing, detail_text=""):
     """Keyword filter. No API key, no account, no ID scan. Roughly 80% as good
     as Claude on obvious listings and noticeably worse on vague ones, so it
     leans cautious: anything it can't confirm has pedals gets rejected."""
     blob = f"{listing['title']} {detail_text}"
 
+    if BAD_CATEGORY.search(listing.get("url", "")):
+        return {"match": False, "deal_score": 1, "reason": "wrong category in URL"}
+    # "Fanatec CSL DD + pedala" never says volan, but the model name is proof
+    # enough. Require either the word or a recognised sim wheel model.
+    if not WHEEL_WORD.search(blob) and not any(rx.search(blob) for _, rx in TIERS):
+        return {"match": False, "deal_score": 1, "reason": "no steering wheel mentioned"}
     if DEALBREAKERS.search(blob):
         return {"match": False, "deal_score": 1, "reason": "broken / for parts / wanted ad"}
     if CONSOLE_ONLY.search(blob):
@@ -400,7 +456,7 @@ def local_judge(listing, detail_text=""):
         score += 1                 # direct drive with pedals is always worth a look
     score = max(1, min(5, score))
 
-    town = TOWNS.search(blob)
+    town = find_location(blob)
     msg = ("Zivjo, me zanima ce je volan se na voljo? Ali stopalke delujejo brez "
            "tezav in ali komplet deluje na PC? Lahko pridem osebno po njega in "
            "placam z gotovino. Hvala za odgovor!")
@@ -408,9 +464,79 @@ def local_judge(listing, detail_text=""):
     return {"match": True, "deal_score": score, "has_pedals": True,
             "has_handbrake": has_hb, "pc_compatible": None,
             "guessed_model": model, "tier": tier,
-            "location": town.group(0) if town else None,
+            "location": town,
             "opening_message": msg,
             "reason": f"keyword match{' + handbrake' if has_hb else ''} (offline filter)"}
+
+
+VERIFY_SYSTEM = """You verify used marketplace listings for someone buying a
+sim racing wheel. The listing is in Slovenian or Croatian.
+
+Answer ONLY with JSON, no fences, no preamble:
+{"is_sim_wheel": true|false,
+ "has_pedals": true|false,
+ "works_on_pc": true|false|null,
+ "has_handbrake": true|false,
+ "model": "best guess or null",
+ "tier": "entry"|"mid"|"high"|"unknown",
+ "condition_concerns": "short phrase or null",
+ "confidence": 1-5,
+ "reason": "one short sentence in English"}
+
+is_sim_wheel: a force feedback or sim racing steering wheel for gaming.
+FALSE for: bicycles, e-bikes, scooters, cars, sewing machines, piano or drum
+pedals, exercise bikes, toy wheels, wheel stands or rigs sold alone, and for
+listings selling only a wheel rim or only pedals as an accessory.
+
+has_pedals: pedals are included IN THIS SALE. "brez stopalk" or "pedale već
+prodane" means false.
+
+works_on_pc: false if it is console-only. Logitech G25/27/29/920/923 and
+Thrustmaster T150/T300/T248 all work on PC. Thrustmaster T80 does not.
+
+Slovenian/Croatian: volan=wheel, stopalke/pedala/pedale=pedals,
+ročna zavora/ručna kočnica=handbrake, menjalnik/mjenjač=shifter,
+za dele=for parts, ne dela=broken, kupim/tražim=wanted ad,
+kot nov=like new, ohranjen=well kept, brez=without."""
+
+
+def verify_with_llm(listing, detail_text):
+    """Second opinion on something the keyword filter already liked.
+    Returns None if no model is configured or the call fails."""
+    if not ((LLM_BASE_URL and LLM_MODEL) or ANTHROPIC_API_KEY):
+        return None
+
+    prompt = (f"title: {listing['title']}\n"
+              f"price: {listing['price']} EUR\n"
+              f"category path: {listing['url']}\n"
+              f"description: {detail_text[:2500] or '(none available)'}")
+    try:
+        if LLM_BASE_URL and LLM_MODEL:
+            r = post_with_retry(
+                f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
+                headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
+                         "Content-Type": "application/json"},
+                json={"model": LLM_MODEL, "max_tokens": 350, "temperature": 0,
+                      "messages": [{"role": "system", "content": VERIFY_SYSTEM},
+                                   {"role": "user", "content": prompt}]},
+                timeout=120)
+            text = r.json()["choices"][0]["message"]["content"]
+        else:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": ANTHROPIC_API_KEY,
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": MODEL, "max_tokens": 350, "system": VERIFY_SYSTEM,
+                      "messages": [{"role": "user", "content": prompt}]},
+                timeout=60)
+            r.raise_for_status()
+            text = "".join(b.get("text", "") for b in r.json().get("content", [])
+                           if b.get("type") == "text")
+        return parse_verdict(text)
+    except Exception as e:
+        print(f"  verification unavailable ({str(e)[:70]})")
+        return None
 
 
 SYSTEM = """You screen used-marketplace listings for a buyer in Slovenia.
@@ -539,6 +665,13 @@ def sanity_check(verdict, listing, detail_text):
                     verdict["guessed_model"] = rx.search(blob).group(0)
                 break
 
+    if BAD_CATEGORY.search(listing.get("url", "")):
+        verdict.update(match=False, deal_score=1, reason="wrong category in URL (veto)")
+        return verdict
+    if not WHEEL_WORD.search(blob) and not any(rx.search(blob) for _, rx in TIERS):
+        verdict.update(match=False, deal_score=1, reason="no wheel mentioned (veto)")
+        return verdict
+
     console_no_pc = (CONSOLE_WORD.search(blob) and not PC_WORD.search(blob)
                      and verdict["tier"] == "unknown")
     if CONSOLE_ONLY.search(blob) or console_no_pc:
@@ -551,24 +684,52 @@ def sanity_check(verdict, listing, detail_text):
     if verdict.get("has_handbrake") is None:
         verdict["has_handbrake"] = bool(HANDBRAKE.search(blob))
     if verdict.get("location") is None:
-        m = TOWNS.search(blob)
-        verdict["location"] = m.group(0) if m else None
+        verdict["location"] = find_location(blob)
     return verdict
 
 
 def judge(listing, detail_text=""):
-    """Whichever brain is configured. Falls back to the offline keyword
-    filter rather than crashing, so a dead API never stops the watcher."""
-    try:
-        if LLM_BASE_URL and LLM_MODEL:
-            return sanity_check(judge_openai_compatible(listing, detail_text),
-                                listing, detail_text)
-        if ANTHROPIC_API_KEY:
-            return sanity_check(judge_anthropic(listing, detail_text),
-                                listing, detail_text)
-    except Exception as e:
-        print(f"  LLM call failed ({e}) - using offline filter for this one")
-    return local_judge(listing, detail_text)
+    """Two stages. The keyword filter is the gate - it is free and it kills
+    the pots, chainsaws and bicycles without spending an API call. Only what
+    survives gets read properly by the model."""
+    verdict = local_judge(listing, detail_text)
+    verdict["verified"] = False
+
+    if not verdict.get("match"):
+        return verdict          # rejected for free, no call made
+
+    check = verify_with_llm(listing, detail_text)
+    if check is None:
+        return verdict          # no model available - keyword verdict stands
+
+    verdict["verified"] = True
+
+    if not check.get("is_sim_wheel"):
+        verdict.update(match=False, deal_score=1,
+                       reason=f"not a sim wheel: {check.get('reason', '')}"[:90])
+        return verdict
+    if check.get("has_pedals") is False:
+        verdict.update(match=False, deal_score=1, reason="no pedals in this sale")
+        return verdict
+    if check.get("works_on_pc") is False:
+        verdict.update(match=False, deal_score=1, reason="console only")
+        return verdict
+
+    # the model read the description, so trust it over the keyword guesses
+    if check.get("tier") and check["tier"] != "unknown":
+        verdict["tier"] = check["tier"]
+    if check.get("model"):
+        verdict["guessed_model"] = check["model"]
+    if check.get("has_handbrake") is not None:
+        verdict["has_handbrake"] = check["has_handbrake"]
+    verdict["concerns"] = check.get("condition_concerns")
+    verdict["reason"] = check.get("reason") or verdict["reason"]
+
+    if check.get("has_handbrake"):
+        verdict["deal_score"] = min(5, verdict["deal_score"] + 1)
+    if (check.get("confidence") or 3) <= 2:
+        verdict["deal_score"] = max(1, verdict["deal_score"] - 1)
+    return verdict
 
 
 # ----------------------------------------------------------------------
@@ -613,11 +774,20 @@ def notify(listing, verdict, med, n_samples, ride):
     else:
         commute_line = "COMMUTE location unknown - ask the seller\n"
 
+    model = verdict.get("guessed_model") or "UNIDENTIFIED - check photos"
+    flags = []
+    if not verdict.get("verified"):
+        flags.append("keyword filter only, unverified")
+    if verdict.get("concerns"):
+        flags.append(str(verdict["concerns"]))
+    flag_line = f"HEADS UP {'; '.join(flags)}\n" if flags else ""
+
     subject = f"[{stars}] {price} - {listing['title'][:60]}"
     text = (
         f"{listing['title']}\n\n"
         f"PRICE   {price}  ({market})\n"
-        f"MODEL   {verdict.get('guessed_model') or '?'}\n"
+        f"MODEL   {model}\n"
+        f"{flag_line}"
         f"INCLUDES {kit}\n"
         f"{commute_line}"
         f"SCORE   {verdict.get('deal_score')}/5 - {verdict.get('reason', '')}\n"
@@ -754,6 +924,9 @@ def main():
                 for tag in dsoup(["script", "style", "nav", "footer", "header"]):
                     tag.decompose()
                 detail = " ".join(dsoup.get_text(" ", strip=True).split())[:4000]
+                if len(detail) < 200:
+                    print(f"  detail page came back nearly empty ({len(detail)} chars)"
+                          f" - location and description checks will be weak")
                 if l["price"] is None:
                     l["price"] = parse_price(detail)
             except Exception as e:
@@ -802,14 +975,16 @@ def main():
                 time.sleep(2)
                 continue
 
-            cheap = med is None or l["price"] <= med * UNDERCUT_FACTOR
+            known = bool(verdict.get("guessed_model")) and tier != "unknown"
+            factor = UNDERCUT_FACTOR if known else UNKNOWN_UNDERCUT
+            cheap = med is None or l["price"] <= med * factor
             if cheap or score >= ALWAYS_NOTIFY_SCORE:
                 total_hits += 1
                 notify(l, verdict, med, n, ride)
             else:
-                shown = f"{l['price']:.0f}" if l["price"] else "no price"
-                print(f"  matched but pricey: {l['title'][:50]} "
-                      f"{shown} vs {med:.0f} median ({tier})")
+                lane = "known" if known else f"unknown, needs <{med * factor:.0f}"
+                print(f"  matched but pricey [{lane}]: {l['title'][:44]} "
+                      f"{l['price']:.0f} vs {med:.0f} median ({tier})")
 
             time.sleep(2)
 

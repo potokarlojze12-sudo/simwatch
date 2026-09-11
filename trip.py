@@ -143,7 +143,8 @@ def fuel_price(con):
 # where is it
 # ----------------------------------------------------------------------
 
-NOISE = re.compile(r"\b(okolica|blizu|center|centru|pri|pošta|p\.?e\.?)\b", re.I)
+NOISE = re.compile(r"\b(okolica|blizu|center|centru|pri|pošta|poštni|postni|"
+                   r"p\.?e\.?|mesto in okolica)\b", re.I)
 
 
 def clean_place(place):
