@@ -510,7 +510,9 @@ def local_judge(listing, detail_text=""):
 VERIFY_SYSTEM = """You verify used marketplace listings for someone buying a
 sim racing wheel. The listing is in Slovenian or Croatian.
 
-Answer ONLY with JSON, no fences, no preamble:
+Your entire reply must be one JSON object. The first character you write must
+be { and the last must be }. No preamble, no reasoning, no code fences, no
+explanation before or after. Do not restate the task.
 {"is_sim_wheel": true|false,
  "has_pedals": true|false,
  "works_on_pc": true|false|null,
@@ -558,7 +560,7 @@ def verify_with_llm(listing, detail_text):
                         f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
                         headers={"Authorization": f"Bearer {LLM_API_KEY or 'none'}",
                                  "Content-Type": "application/json"},
-                        json={"model": name, "max_tokens": 350, "temperature": 0,
+                        json={"model": name, "max_tokens": 800, "temperature": 0,
                               "messages": [{"role": "system", "content": VERIFY_SYSTEM},
                                            {"role": "user", "content": prompt}]},
                         timeout=120)
@@ -575,7 +577,7 @@ def verify_with_llm(listing, detail_text):
                 headers={"x-api-key": ANTHROPIC_API_KEY,
                          "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": MODEL, "max_tokens": 350, "system": VERIFY_SYSTEM,
+                json={"model": MODEL, "max_tokens": 800, "system": VERIFY_SYSTEM,
                       "messages": [{"role": "user", "content": prompt}]},
                 timeout=60)
             r.raise_for_status()
@@ -647,8 +649,8 @@ def parse_verdict(text):
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"match": False, "deal_score": 1,
-                "reason": f"unparseable model reply: {text[:120]}"}
+        print(f"  could not parse model reply, ignoring it: {text[:90]}")
+        return None
 
 
 def judge_anthropic(listing, detail_text):
@@ -762,8 +764,8 @@ def judge(listing, detail_text=""):
         return verdict          # rejected for free, no call made
 
     check = verify_with_llm(listing, detail_text)
-    if check is None:
-        return verdict          # no model available - keyword verdict stands
+    if not check or "is_sim_wheel" not in check:
+        return verdict          # no usable answer - keyword verdict stands
 
     verdict["verified"] = True
 
