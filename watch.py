@@ -76,7 +76,8 @@ NOTIFY_MIN_SCORE = 3       # only ping me for deal_score >= this (1-5)
 # steal before it earns a buzz.
 UNDERCUT_FACTOR = 1.00        # known model: at or below median
 UNKNOWN_UNDERCUT = 0.70       # unidentified: must be 30% under
-MIN_SAMPLES_FOR_MEDIAN = 5 # below this, no baseline exists yet -> notify anyway
+MIN_SAMPLES_FOR_MEDIAN = 5   # tier medians need this many before they count
+MIN_SAMPLES_FOR_MODEL = 3    # per-model buckets fill slowly in a small market
 ALWAYS_NOTIFY_SCORE = 5    # a 5/5 gets through even if it's above median
 
 # Don't buzz the phone in the middle of the night. Message still arrives,
@@ -218,13 +219,13 @@ def record_price(con, listing, tier):
         con.commit()
 
 
-def median_price(con, tier, days=120):
+def median_price(con, tier, days=120, min_samples=None):
     """Median asking price for this tier over the last few months.
     Median, not mean - one €900 outlier shouldn't drag the bar up."""
     cutoff = int(time.time()) - days * 86400
     rows = [r[0] for r in con.execute(
         "SELECT price FROM prices WHERE tier=? AND ts>? ORDER BY price", (tier, cutoff))]
-    if len(rows) < MIN_SAMPLES_FOR_MEDIAN:
+    if len(rows) < (min_samples or MIN_SAMPLES_FOR_MEDIAN):
         return None, len(rows)
     n = len(rows)
     mid = n // 2
@@ -1092,9 +1093,11 @@ def main():
                 record_price(con, {**l, "id": l["id"] + "#t"}, tier)
             remember_fingerprint(con, l)
 
-            # per-model median first, tier median as the fallback
-            med, n = median_price(con, bucket)
-            if med is None and bucket != tier:
+            known = bool(verdict.get("guessed_model")) and tier != "unknown"
+            if bucket.startswith("model:"):
+                # thin bucket -> no baseline, rather than borrowing the tier's
+                med, n = median_price(con, bucket, min_samples=MIN_SAMPLES_FOR_MODEL)
+            else:
                 med, n = median_price(con, tier)
 
             ride = trip.commute(con, verdict.get("location"), site)
@@ -1113,7 +1116,6 @@ def main():
                 time.sleep(2)
                 continue
 
-            known = bool(verdict.get("guessed_model")) and tier != "unknown"
             factor = UNDERCUT_FACTOR if known else UNKNOWN_UNDERCUT
             cheap = med is None or l["price"] <= med * factor
             if cheap or score >= ALWAYS_NOTIFY_SCORE:
