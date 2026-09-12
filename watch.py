@@ -71,11 +71,13 @@ NOTIFY_MIN_SCORE = 3       # only ping me for deal_score >= this (1-5)
 # earns a ping if it undercuts the running median for its tier of wheel.
 # Comparing a G29 against a Fanatec DD would be meaningless, so prices are
 # tracked separately per tier.
-# Two lanes. A named model we can price confidently, so at or below median is
-# enough. An unidentified wheel might be anything, so it has to be a genuine
-# steal before it earns a buzz.
-UNDERCUT_FACTOR = 1.00        # known model: at or below median
-UNKNOWN_UNDERCUT = 0.70       # unidentified: must be 30% under
+# You don't own a wheel yet, so the job is "tell me about wheels I could buy",
+# not "tell me about bargains". Every match inside the budget gets through and
+# the median rides along as context - 23% below market, 12% above - so you can
+# judge for yourself. Set NOTIFY_ONLY_DEALS = True to go back to gating.
+NOTIFY_ONLY_DEALS = os.environ.get("NOTIFY_ONLY_DEALS", "").lower() in ("1", "true", "yes")
+UNDERCUT_FACTOR = 1.00        # only used when NOTIFY_ONLY_DEALS is on
+UNKNOWN_UNDERCUT = 0.70
 MIN_SAMPLES_FOR_MEDIAN = 5   # tier medians need this many before they count
 MIN_SAMPLES_FOR_MODEL = 3    # per-model buckets fill slowly in a small market
 ALWAYS_NOTIFY_SCORE = 5    # a 5/5 gets through even if it's above median
@@ -809,11 +811,19 @@ def notify(listing, verdict, med, n_samples, ride):
 
     if med and listing["price"]:
         delta = (listing["price"] - med) / med * 100
-        market = (f"{abs(delta):.0f}% {'BELOW' if delta < 0 else 'above'} the "
-                  f"{med:.0f} EUR median for {verdict.get('tier','?')}-tier "
-                  f"(from {n_samples} listings)")
+        if delta <= -25:
+            call = "CHEAP"
+        elif delta <= -5:
+            call = "good price"
+        elif delta < 15:
+            call = "about market"
+        else:
+            call = "pricey"
+        market = (f"{call} - {abs(delta):.0f}% {'under' if delta < 0 else 'over'} "
+                  f"the {med:.0f} EUR usual, from {n_samples} seen")
     else:
-        market = f"no price baseline yet ({n_samples} {verdict.get('tier','?')}-tier samples so far)"
+        market = (f"no price history for this model yet "
+                  f"({n_samples} seen) - judge it yourself")
 
     kit = []
     if verdict.get("has_pedals"):
@@ -1118,7 +1128,7 @@ def main():
 
             factor = UNDERCUT_FACTOR if known else UNKNOWN_UNDERCUT
             cheap = med is None or l["price"] <= med * factor
-            if cheap or score >= ALWAYS_NOTIFY_SCORE:
+            if (not NOTIFY_ONLY_DEALS) or cheap or score >= ALWAYS_NOTIFY_SCORE:
                 total_hits += 1
                 notify(l, verdict, med, n, ride)
             else:
