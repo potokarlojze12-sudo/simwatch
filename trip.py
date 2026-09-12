@@ -57,6 +57,55 @@ COUNTRY_HINT = {"bolha": "Slovenia", "salomon": "Slovenia", "njuskalo": "Croatia
 # ----------------------------------------------------------------------
 
 
+# Nominatim blocks datacentre IPs, and GitHub Actions runs in one. Towns do
+# not move, so the ones that matter are just written down. No API, no 403,
+# no rate limit, instant.
+TOWNS_XY = {
+    # Slovenia
+    "ljubljana": (46.0569, 14.5058), "maribor": (46.5547, 15.6459),
+    "celje": (46.2311, 15.2683), "kranj": (46.2389, 14.3556),
+    "koper": (45.5481, 13.7302), "velenje": (46.3592, 15.1103),
+    "novo mesto": (45.8010, 15.1710), "ptuj": (46.4200, 15.8700),
+    "trbovlje": (46.1550, 15.0530), "kamnik": (46.2250, 14.6117),
+    "jesenice": (46.4367, 14.0525), "nova gorica": (45.9550, 13.6483),
+    "domžale": (46.1383, 14.5744), "domzale": (46.1383, 14.5744),
+    "škofja loka": (46.1656, 14.3064), "skofja loka": (46.1656, 14.3064),
+    "murska sobota": (46.6583, 16.1619), "postojna": (45.7750, 14.2131),
+    "grosuplje": (45.9556, 14.6558), "vrhnika": (45.9631, 14.2939),
+    "litija": (46.0586, 14.8306), "krško": (45.9589, 15.4917),
+    "krsko": (45.9589, 15.4917), "brežice": (45.9044, 15.5911),
+    "brezice": (45.9044, 15.5911), "slovenj gradec": (46.5103, 15.0806),
+    "ravne": (46.5450, 14.9639), "idrija": (46.0019, 14.0272),
+    "ajdovščina": (45.8869, 13.9089), "ajdovscina": (45.8869, 13.9089),
+    "sežana": (45.7075, 13.8722), "sezana": (45.7075, 13.8722),
+    "izola": (45.5386, 13.6608), "piran": (45.5286, 13.5683),
+    "portorož": (45.5142, 13.5906), "portoroz": (45.5142, 13.5906),
+    "ilirska bistrica": (45.5678, 14.2456), "logatec": (45.9169, 14.2258),
+    "cerknica": (45.7947, 14.3603), "ribnica": (45.7397, 14.7267),
+    "kočevje": (45.6428, 14.8631), "kocevje": (45.6428, 14.8631),
+    "trebnje": (45.9081, 15.0033), "zagorje": (46.1339, 14.9958),
+    "hrastnik": (46.1447, 15.0844), "sevnica": (46.0075, 15.3131),
+    "lendava": (46.5647, 16.4508), "ormož": (46.4092, 16.1519),
+    "ormoz": (46.4092, 16.1519), "slovenska bistrica": (46.3922, 15.5722),
+    "radovljica": (46.3439, 14.1744), "bled": (46.3683, 14.1136),
+    "bohinj": (46.2769, 13.8894), "tolmin": (46.1836, 13.7325),
+    "bovec": (46.3383, 13.5522), "rogaška slatina": (46.2419, 15.6386),
+    "trzin": (46.1300, 14.5581), "medvode": (46.1417, 14.4114),
+    "mengeš": (46.1650, 14.5747), "menges": (46.1650, 14.5747),
+    "ig": (45.9603, 14.5286), "škofljica": (45.9836, 14.5750),
+    "skofljica": (45.9836, 14.5750), "vič": (46.0361, 14.4772),
+    # Croatia
+    "zagreb": (45.8150, 15.9819), "karlovac": (45.4870, 15.5478),
+    "varaždin": (46.3044, 16.3378), "varazdin": (46.3044, 16.3378),
+    "rijeka": (45.3271, 14.4422), "samobor": (45.8028, 15.7108),
+    "sisak": (45.4661, 16.3781), "krapina": (46.1608, 15.8783),
+    "zaprešić": (45.8556, 15.8078), "zapresic": (45.8556, 15.8078),
+    "velika gorica": (45.7125, 16.0756), "pula": (44.8666, 13.8496),
+    "opatija": (45.3378, 14.3053), "split": (43.5081, 16.4402),
+    "osijek": (45.5550, 18.6955), "zadar": (44.1194, 15.2314),
+}
+
+
 def init(con):
     con.execute("CREATE TABLE IF NOT EXISTS geo ("
                 " place TEXT PRIMARY KEY, lat REAL, lng REAL, km REAL, ts INTEGER)")
@@ -163,8 +212,18 @@ def geocode(con, place, site):
     country = COUNTRY_HINT.get(site, "Slovenia")
     key = f"{country}|{place.lower()}"
     row = con.execute("SELECT lat, lng, km FROM geo WHERE place=?", (key,)).fetchone()
-    if row:
+    if row and row[0] is not None:
         return {"lat": row[0], "lng": row[1], "km": row[2], "place": place}
+
+    # the built-in table handles almost everything without touching the network
+    known = TOWNS_XY.get(place.lower())
+    if known:
+        lat, lng = known
+        km = road_km(lat, lng)
+        con.execute("INSERT OR REPLACE INTO geo VALUES (?,?,?,?,?)",
+                    (key, lat, lng, km, int(time.time())))
+        con.commit()
+        return {"lat": lat, "lng": lng, "km": km, "place": place}
 
     try:
         time.sleep(1.1)  # Nominatim asks for max 1 request/second

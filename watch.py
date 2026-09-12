@@ -195,6 +195,20 @@ def remember_fingerprint(con, listing):
     con.commit()
 
 
+MODEL_FAMILY = re.compile(
+    r"\b(g25|g27|g29|g920|g923|t150|t128|t248|t300|t500|tmx|ts-?xw|t598|t818|"
+    r"csl dd|csl elite|clubsport|csr|dd1|dd2|momo|wingman|sidewinder|"
+    r"r5|r9|r12|r16|r21)\b", re.I)
+
+
+def price_bucket(verdict, tier):
+    """Prefer a per-model bucket: a G29 should be priced against other G29s.
+    Fall back to the tier when the model is unknown or samples are thin."""
+    blob = f"{verdict.get('guessed_model') or ''}"
+    m = MODEL_FAMILY.search(blob)
+    return f"model:{m.group(0).lower()}" if m else tier
+
+
 def record_price(con, listing, tier):
     """Every listing that meets the requirements feeds the baseline,
     whether or not it was worth a notification."""
@@ -359,15 +373,17 @@ WANTED_JUNK = re.compile(
     r"elektri[cč]n\w* kolo|zlo[zž]ljiv\w*|skiro\w*|monocikl\w*)\b", re.I)
 
 TIERS = [
+    ("vintage", re.compile(r"\b(momo|wingman|sidewinder|"
+                           r"formula force|driving force pro|dfp|g25|"
+                           r"speed force|nascar racing wheel)\b", re.I)),
     ("high", re.compile(r"\b(fanatec (dd|dd\+|podium|csl dd)|dd1|dd2|moza (r3|r5|r9|r12|r16|r21)|"
                         r"simucube|simagic|asetek|vrs direct|cammus|t598|t818|"
                         r"direct drive|dirketni pogon)\b", re.I)),
     ("mid",  re.compile(r"\b(t300|t500|ts-?xw|ts-?pc|csl elite|clubsport|csr|"
                         r"logitech pro|g pro (wheel|racing)|t-?gt|"
                         r"csl(?! dd)|accuforce|g940)\b", re.I)),
-    ("entry", re.compile(r"\b(g25|g27|g29|g920|g923|g" r"29|t150|t128|t248|tmx|"
-                         r"t3pa|driving force|force feedback|ffb|"
-                         r"momo racing|dfgt|wingman)\b", re.I)),
+    ("entry", re.compile(r"\b(g27|g29|g920|g923|t150|t128|t248|tmx|"
+                         r"t3pa|driving force gt|dfgt|force feedback|ffb)\b", re.I)),
 ]
 
 # The strongest signal available and I was ignoring it: bolha puts the
@@ -945,6 +961,19 @@ con_global = None
 # ----------------------------------------------------------------------
 
 
+def location_selftest(con):
+    """Prove the geocode -> routing -> fuel chain works without waiting for a
+    listing to pass every filter. Results are cached, so this costs one
+    Nominatim call ever, not one per run."""
+    ride = trip.commute(con, "Ljubljana", "bolha")
+    if not ride:
+        print("location check: FAILED - could not resolve Ljubljana")
+        return
+    print(f"location check: Ljubljana -> {ride['km_one_way']:.0f} km each way, "
+          f"{ride['litres']:.1f} L, {ride['fuel_eur']:.2f} EUR round trip "
+          f"at {ride['price_per_litre']:.3f}/l ({ride['source']})")
+
+
 def main():
     global con_global
     con = db()
@@ -1055,9 +1084,16 @@ def main():
                 continue
 
             # it meets the requirements, so its price is market data either way
-            record_price(con, l, tier)
+            bucket = price_bucket(verdict, tier)
+            record_price(con, l, bucket)
+            if bucket != tier:
+                record_price(con, {**l, "id": l["id"] + "#t"}, tier)
             remember_fingerprint(con, l)
-            med, n = median_price(con, tier)
+
+            # per-model median first, tier median as the fallback
+            med, n = median_price(con, bucket)
+            if med is None and bucket != tier:
+                med, n = median_price(con, tier)
 
             ride = trip.commute(con, verdict.get("location"), site)
             if ride and ride["too_far"]:
@@ -1117,6 +1153,7 @@ def main():
         note_push(con)
     else:
         print(f"\ndone: {total_new} new listings, {total_hits} worth your time")
+        location_selftest(con)
         gap = hours_since_last_push(con)
         if gap is not None and gap >= HEARTBEAT_HOURS:
             seen_total = con.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
